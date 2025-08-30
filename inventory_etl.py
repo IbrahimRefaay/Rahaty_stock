@@ -20,7 +20,7 @@ import os
 ODOO_URL = "https://rahatystore.odoo.com"
 ODOO_DB = "rahatystore-live-12723857"
 ODOO_USERNAME = "Data.team@rahatystore.com"
-ODOO_PASSWORD = os.getenv('ODOO_PASSWORD') # Reads the password from a GitHub Secret
+ODOO_PASSWORD = "Rs.Data.team" # Reads the password from a GitHub Secret
 
 # --- Google BigQuery Settings ---
 PROJECT_ID = "spartan-cedar-467808-p9" 
