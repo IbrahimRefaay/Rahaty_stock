@@ -1,26 +1,38 @@
 # Odoo Inventory ETL Pipeline
 
-This repository contains an automated ETL pipeline that extracts inventory data from Odoo and loads it into Google BigQuery for analytics and reporting.
+This repository contains automated ETL pipelines that extract inventory data from Odoo and load it into Google BigQuery for analytics and reporting.
 
 ## Overview
 
-The pipeline runs daily at 00:15 UTC (3:15 AM Riyadh time) and performs the following operations:
+The repository includes two complementary ETL scripts:
 
+### 1. Historical Inventory Tracking (`inventory_etl.py`)
+- Runs daily at 00:15 UTC (3:15 AM Riyadh time)
+- Maintains historical snapshots with location-level detail
+- Creates detailed inventory history with date-based tracking
+
+### 2. Current Stock Snapshot (`stock_etl.py`)
+- Runs daily at 18:00 UTC (9:00 PM Riyadh time) - End of business day
+- Provides current stock levels by product
+- Simplified view focused on product-level inventory
+
+Both pipelines perform the following operations:
 1. **Extract**: Connects to Odoo API to fetch current inventory levels
-2. **Transform**: Processes the data and calculates available quantities
-3. **Load**: Uploads the data to BigQuery while maintaining historical records
+2. **Transform**: Processes the data and calculates available quantities  
+3. **Load**: Uploads the data to BigQuery with appropriate schema
 
 ## Features
 
-- **Automated daily runs** via GitHub Actions
+- **Automated daily runs** via GitHub Actions with timezone awareness
 - **Manual trigger** capability for on-demand execution
-- **Historical data preservation** with daily snapshots
+- **Two complementary views**: Historical tracking and current snapshots
 - **Secure credential management** using GitHub Secrets
 - **Comprehensive logging** for monitoring and debugging
 
-## Data Schema
+## Data Schemas
 
-The pipeline creates a table with the following structure:
+### Historical Inventory Table (`inventory_levels_history`)
+Detailed location-level inventory tracking with historical snapshots.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -33,6 +45,20 @@ The pipeline creates a table with the following structure:
 | on_hand_quantity | FLOAT | Total quantity on hand |
 | reserved_quantity | FLOAT | Reserved quantity |
 | available_quantity | FLOAT | Available quantity (on_hand - reserved) |
+
+### Current Stock Table (`stock_data`)
+Simplified product-level current stock snapshot updated at end of business day.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| Product Name | STRING | Product display name |
+| Barcode | STRING | Product barcode |
+| Category | STRING | Product category |
+| Qty On Hand | FLOAT | Total quantity on hand |
+| Reserved Qty | FLOAT | Reserved quantity |
+| Available Qty | FLOAT | Available quantity (on_hand - reserved) |
+| Unit Cost | FLOAT | Standard cost per unit |
+| Total Cost | FLOAT | Total inventory value (qty × unit cost) |
 
 ## Setup Instructions
 
@@ -59,12 +85,13 @@ Your Google Cloud Service Account key in JSON format. The service account needs:
 Ensure your BigQuery project has:
 - Dataset: `Orders`
 - Tables will be created automatically:
-  - `inventory_levels_history` (main historical table)
+  - `inventory_levels_history` (detailed historical table with locations)
   - `inventory_levels_staging` (temporary staging table)
+  - `stock_data` (current stock snapshot table)
 
 ### 4. Customize Configuration
 
-Update the following variables in `inventory_etl.py` if needed:
+Update the following variables in both `inventory_etl.py` and `stock_etl.py` if needed:
 
 ```python
 # Odoo Settings
@@ -80,16 +107,21 @@ DATASET_ID = "your-dataset-name"
 ## Usage
 
 ### Automatic Execution
-The pipeline runs automatically every day at 00:15 UTC.
+- **Historical Inventory**: Runs automatically every day at 00:15 UTC (3:15 AM Riyadh time)
+- **Stock Snapshot**: Runs automatically every day at 18:00 UTC (9:00 PM Riyadh time)
 
 ### Manual Execution
 1. Go to the "Actions" tab in your GitHub repository
 2. Select "Odoo Inventory ETL" workflow
 3. Click "Run workflow"
+4. Choose which script to run:
+   - `both`: Run both historical and stock snapshot scripts
+   - `inventory_history`: Run only the historical tracking script
+   - `stock_snapshot`: Run only the current stock snapshot script
 
 ## Monitoring
 
-Check the Actions tab for execution logs and status. The pipeline includes comprehensive logging for:
+Check the Actions tab for execution logs and status. Both pipelines include comprehensive logging for:
 - Authentication status
 - Data extraction progress
 - Upload confirmation
@@ -98,13 +130,13 @@ Check the Actions tab for execution logs and status. The pipeline includes compr
 ## Architecture
 
 ```
-┌─────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   Odoo API  │───▶│  GitHub      │───▶│   BigQuery      │
-│             │    │  Actions     │    │                 │
-│ Inventory   │    │              │    │ • Staging Table │
-│ Data        │    │ • Python ETL │    │ • History Table │
-│             │    │ • Scheduler  │    │                 │
-└─────────────┘    └──────────────┘    └─────────────────┘
+┌─────────────┐    ┌──────────────┐    ┌─────────────────────────────┐
+│   Odoo API  │───▶│  GitHub      │───▶│         BigQuery            │
+│             │    │  Actions     │    │                             │
+│ Inventory   │    │              │    │ • inventory_levels_history  │
+│ Data        │    │ • Python ETL │    │ • inventory_levels_staging  │
+│             │    │ • Scheduler  │    │ • stock_data               │
+└─────────────┘    └──────────────┘    └─────────────────────────────┘
 ```
 
 ## Troubleshooting
