@@ -1,180 +1,184 @@
-# odoo_inventory_pipeline.py
-# FINAL VERSION for GitHub Actions: Reads secrets and credentials from the environment.
+# inventory_etl.py
+# This script fetches the latest inventory snapshot from Odoo and uploads it to BigQuery.
 
 import requests
-import json
-import logging
 import pandas as pd
-from google.oauth2 import service_account
-import pandas_gbq
+import logging
 from google.cloud import bigquery
-from datetime import datetime, timedelta
-from dateutil import tz
-import os
-
-# ==============================================================================
-# الإعدادات الرئيسية
-# ==============================================================================
+from google.oauth2 import service_account
+from google.cloud.exceptions import NotFound
 
 # --- Odoo Connection Settings ---
 ODOO_URL = "https://rahatystore.odoo.com"
 ODOO_DB = "rahatystore-live-12723857"
 ODOO_USERNAME = "Data.team@rahatystore.com"
-ODOO_PASSWORD = "Rs.Data.team" # Reads the password from a GitHub Secret
+ODOO_PASSWORD = "Rs.Data.team"
 
-# --- Google BigQuery Settings ---
-PROJECT_ID = "spartan-cedar-467808-p9" 
-DATASET_ID = "Orders" 
-TABLE_ID = "inventory_levels_history"
-STAGING_TABLE_ID = "inventory_levels_staging"
+# --- BigQuery Settings ---
+PROJECT_ID = "spartan-cedar-467808-p9"
+DATASET_ID = "Orders"
+STOCK_TABLE = "stock_data"
+CREDENTIALS_FILE_PATH = "spartan-cedar-467808-p9-dda96452a885.json"
 
-# ==============================================================================
-# إعدادات إضافية
-# ==============================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-DESTINATION_TABLE = f"{DATASET_ID}.{TABLE_ID}"
-STAGING_DESTINATION_TABLE = f"{DATASET_ID}.{STAGING_TABLE_ID}"
-session = requests.Session()
 
-# ==============================================================================
-# الدوال الأساسية
-# ==============================================================================
-
-def odoo_call(endpoint, params):
-    url = f"{ODOO_URL}{endpoint}"
-    headers = {'Content-Type': 'application/json'}
-    payload = {"jsonrpc": "2.0", "method": "call", "params": params}
+def get_odoo_session(url, db, username, password):
+    auth_url = f"{url}/web/session/authenticate"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "db": db,
+            "login": username,
+            "password": password
+        }
+    }
+    session = requests.Session()
     try:
-        response = session.post(url, headers=headers, data=json.dumps(payload), timeout=180)
+        response = session.post(auth_url, json=payload, timeout=30)
+        response.raise_for_status()
+        if response.json().get("result", {}).get("uid"):
+            logging.info("✅ Authentication successful.")
+            return session
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Authentication request failed: {e}")
+        return None
+    logging.error("❌ Authentication failed. Check credentials or Odoo server status.")
+    return None
+
+def call_odoo_rpc(session, url, model, method, params):
+    rpc_url = f"{url}/web/dataset/call_kw"
+    rpc_params = {
+        'model': model,
+        'method': method,
+        'args': params.get('args', []),
+        'kwargs': params.get('kwargs', {})
+    }
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": rpc_params
+    }
+    try:
+        response = session.post(rpc_url, json=payload, timeout=120)
         response.raise_for_status()
         result = response.json()
-        if 'error' in result:
-            logging.error(f"Odoo API Error: {result['error']['data']['message']}")
+        if result.get('error'):
+            error_details = result['error']
+            logging.error(f"❌ Odoo RPC Error: {error_details.get('message')}")
+            if 'data' in error_details and 'debug' in error_details['data']:
+                logging.error(f"    - Debug Info:\n{error_details['data']['debug']}")
+            else:
+                logging.error(f"    - Data: {error_details.get('data')}")
             return None
         return result.get('result')
     except requests.exceptions.RequestException as e:
-        logging.error(f"HTTP Request Error: {e}")
+        logging.error(f"❌ RPC call failed: {e}")
         return None
 
-def get_inventory_data_to_dataframe():
-    logging.info("Authenticating...")
-    auth_params = {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
-    if not odoo_call("/web/session/authenticate", auth_params):
-        raise Exception("Authentication failed.")
-    logging.info("✅ Authentication successful!")
+def ensure_stock_table_exists(client, dataset_id, table_id):
+    table_ref = client.dataset(dataset_id).table(table_id)
+    try:
+        client.get_table(table_ref)
+        logging.info(f"Table {table_id} already exists.")
+    except NotFound:
+        schema = [
+            bigquery.SchemaField("Product Name", "STRING"),
+            bigquery.SchemaField("Barcode", "STRING"),
+            bigquery.SchemaField("Category", "STRING"),
+            bigquery.SchemaField("Qty On Hand", "FLOAT"),
+            bigquery.SchemaField("Reserved Qty", "FLOAT"),
+            bigquery.SchemaField("Available Qty", "FLOAT"),
+            bigquery.SchemaField("Unit Cost", "FLOAT"),
+            bigquery.SchemaField("Total Cost", "FLOAT"),
+        ]
+        table = bigquery.Table(table_ref, schema=schema)
+        client.create_table(table)
+        logging.info(f"Created table {table_id} in dataset {dataset_id}.")
 
-    logging.info("Step 1: Fetching all stock quants...")
-    quant_params = {
-        "model": "stock.quant", "method": "search_read", "args": [],
-        "kwargs": { "domain": [('location_id.usage', '=', 'internal')], "fields": ['product_id', 'location_id', 'quantity', 'reserved_quantity'] }
-    }
-    quants = odoo_call("/web/dataset/call_kw", quant_params)
-    if not quants:
-        logging.warning("No stock quants found.")
-        return pd.DataFrame()
-    logging.info(f"Found {len(quants)} stock records.")
-    
-    product_ids = list(set([q['product_id'][0] for q in quants if q.get('product_id')]))
-    location_ids = list(set([q['location_id'][0] for q in quants if q.get('location_id')]))
-    
-    logging.info(f"Step 2: Fetching details for products and locations...")
-    product_params = { "model": "product.product", "method": "read", "args": [product_ids], "kwargs": {"fields": ['display_name', 'barcode']} }
-    products = odoo_call("/web/dataset/call_kw", product_params) or []
-    location_params = { "model": "stock.location", "method": "read", "args": [list(location_ids)], "kwargs": {"fields": ['complete_name']} }
-    locations = odoo_call("/web/dataset/call_kw", location_params) or []
-
-    logging.info("Step 3: Building the final DataFrame...")
-    products_by_id = {p['id']: p for p in products}
-    locations_by_id = {l['id']: l for l in locations}
-
-    final_rows = []
-    
-    riyadh_tz = tz.gettz('Asia/Riyadh')
-    now = datetime.now(riyadh_tz)
-    if now.hour < 21:
-        business_date = now.date() - timedelta(days=1)
-    else:
-        business_date = now.date()
-    logging.info(f"Assigning snapshot to business date: {business_date}")
-    
-    for quant in quants:
-        product_info = products_by_id.get(quant['product_id'][0], {})
-        location_info = locations_by_id.get(quant['location_id'][0], {})
-        
-        on_hand = quant.get('quantity', 0)
-        reserved = quant.get('reserved_quantity', 0)
-        available = on_hand - reserved
-        
-        row = {
-            'snapshot_date': business_date,
-            'product_id': str(quant['product_id'][0]),
-            'product_name': product_info.get('display_name'),
-            'product_barcode': product_info.get('barcode'),
-            'location_id': str(quant['location_id'][0]),
-            'location_name': location_info.get('complete_name'),
-            'on_hand_quantity': on_hand,
-            'reserved_quantity': reserved,
-            'available_quantity': available
-        }
-        final_rows.append(row)
-    
-    df = pd.DataFrame(final_rows)
-    df['snapshot_date'] = pd.to_datetime(df['snapshot_date']).dt.date
-    logging.info(f"✅ Final DataFrame created successfully with {len(df)} rows.")
-    return df
-
-def upload_df_to_bigquery(df, project_id):
-    """Uploads data to staging, then rebuilds the final table to store history."""
-    if df.empty:
-        logging.warning("DataFrame is empty. Skipping BigQuery upload.")
+def main():
+    logging.info("Connecting to Odoo...")
+    session = get_odoo_session(ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD)
+    if not session:
         return
-        
-    # Credentials will be found automatically from the environment variable
-    
-    logging.info(f"Uploading {len(df)} new rows to staging table: {STAGING_DESTINATION_TABLE}...")
-    try:
-        df.to_gbq(destination_table=STAGING_DESTINATION_TABLE, project_id=project_id, 
-                  if_exists='replace', progress_bar=False)
-        logging.info("✅ Data successfully uploaded to staging table.")
-    except Exception as e:
-        logging.error(f"An error occurred while uploading to the staging table: {e}")
-        raise
 
-    logging.info(f"Rebuilding final historical table {DESTINATION_TABLE}...")
-    
-    rebuild_query = f"""
-        SELECT *
-        FROM `{project_id}.{DESTINATION_TABLE}`
-        WHERE snapshot_date != CURRENT_DATE('UTC')
-        UNION ALL
-        SELECT *
-        FROM `{project_id}.{STAGING_DESTINATION_TABLE}`
-    """
-    
+    logging.info("📦 Fetching product data...")
+    products = call_odoo_rpc(session, ODOO_URL, "product.product", "search_read", {
+        "args": [[("type", "=", "product")]],
+        "kwargs": {
+            "fields": ["id", "display_name", "barcode", "product_tmpl_id", "standard_price", "categ_id"]
+        }
+    })
+    if not products:
+        logging.error("No products found or an error occurred. Exiting.")
+        return
+
+    products_df = pd.DataFrame(products)
+    if products_df.empty:
+        logging.error("❌ Product data is empty.")
+        return
+
+    products_df["product_id"] = products_df["id"]
+    products_df["category"] = products_df["categ_id"].apply(lambda x: x[1] if isinstance(x, list) and len(x) > 1 else "")
+    logging.info(f"✅ Loaded {len(products_df)} products.")
+
+    logging.info("📊 Fetching stock quantities...")
+    stock_quants = call_odoo_rpc(session, ODOO_URL, "stock.quant", "search_read", {
+        "args": [[("location_id.usage", "=", "internal")]],
+        "kwargs": {
+            "fields": ["product_id", "quantity", "reserved_quantity"]
+        }
+    })
+    if stock_quants is None:
+        logging.error("Could not fetch stock quantities. Exiting.")
+        return
+
+    quant_df = pd.DataFrame(stock_quants)
+    if quant_df.empty or "product_id" not in quant_df.columns:
+        logging.warning("⚠️ No stock quant data found.")
+        stock_summary = pd.DataFrame(columns=['product_id', 'on_hand_quantity', 'reserved_quantity', 'available_quantity'])
+    else:
+        quant_df["product_id"] = quant_df["product_id"].apply(lambda x: x[0] if isinstance(x, list) else x)
+        stock_summary = quant_df.groupby("product_id").agg({
+            "quantity": "sum",
+            "reserved_quantity": "sum"
+        }).reset_index()
+        stock_summary.rename(columns={"quantity": "on_hand_quantity"}, inplace=True)
+        stock_summary["available_quantity"] = stock_summary["on_hand_quantity"] - stock_summary["reserved_quantity"]
+
+    logging.info("📎 Merging data...")
+    df = pd.merge(products_df, stock_summary, on="product_id", how="left")
+
+    # Fill missing values for products that may not have stock records
+    df["on_hand_quantity"].fillna(0, inplace=True)
+    df["reserved_quantity"].fillna(0, inplace=True)
+    df["available_quantity"].fillna(0, inplace=True)
+    df["standard_price"].fillna(0, inplace=True)
+    df["total_cost"] = df["on_hand_quantity"] * df["standard_price"]
+
+    # Define the final structure of the stock table
+    final_df = df[[
+        "display_name", "barcode", "category",
+        "on_hand_quantity", "reserved_quantity", "available_quantity",
+        "standard_price", "total_cost"
+    ]]
+    final_df.columns = [
+        "Product Name", "Barcode", "Category",
+        "Qty On Hand", "Reserved Qty", "Available Qty",
+        "Unit Cost", "Total Cost"
+    ]
+
+    # Upload to BigQuery
+    logging.info(f"📤 Uploading to BigQuery table: {DATASET_ID}.{STOCK_TABLE}")
     try:
-        client = bigquery.Client(project=project_id)
-        job_config = bigquery.QueryJobConfig(
-            destination=f"{project_id}.{DESTINATION_TABLE}",
-            write_disposition="WRITE_TRUNCATE",
-        )
-        query_job = client.query(rebuild_query, job_config=job_config)
-        query_job.result()
-        logging.info(f"✅ Rebuild successful. Final historical table is now up-to-date.")
+        credentials = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE_PATH)
+        bq_client = bigquery.Client(project=PROJECT_ID, credentials=credentials)
+        ensure_stock_table_exists(bq_client, DATASET_ID, STOCK_TABLE)
+        final_df.to_gbq(destination_table=f"{DATASET_ID}.{STOCK_TABLE}", project_id=PROJECT_ID,
+                        if_exists='replace', credentials=credentials)
+        logging.info(f"✅ Data uploaded to BigQuery table: {DATASET_ID}.{STOCK_TABLE}")
     except Exception as e:
-        logging.error(f"An error occurred during the table rebuild operation: {e}")
-        raise
+        logging.error(f"❌ Failed to upload to BigQuery: {e}")
 
 if __name__ == "__main__":
-    logging.info("--- Starting Odoo Inventory History to BigQuery ETL Process ---")
-    try:
-        if not ODOO_PASSWORD:
-            raise ValueError("ODOO_PASSWORD secret is not set in the environment.")
-        if not os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):
-             raise ValueError("GCP credentials are not set in the environment.")
-
-        final_df = get_inventory_data_to_dataframe()
-        if final_df is not None and not final_df.empty:
-            upload_df_to_bigquery(final_df, PROJECT_ID)
-        logging.info("--- ETL Process Completed Successfully ---")
-    except Exception as e:
-        logging.critical(f"--- ETL Process Failed ---", exc_info=True)
+    main()
