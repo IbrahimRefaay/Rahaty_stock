@@ -1,4 +1,4 @@
-# inventory_etl.py
+# odoo_inventory_pipeline.py
 # FINAL VERSION for GitHub Actions: Reads secrets and credentials from the environment.
 
 import requests

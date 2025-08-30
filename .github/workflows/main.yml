@@ -36,4 +36,4 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: 'gcp-key.json'
           # This securely provides the Odoo password to your Python script
           ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
-        run: python inventory_etl.py
+        run: python odoo_inventory_pipeline.py

@@ -64,7 +64,7 @@ Ensure your BigQuery project has:
 
 ### 4. Customize Configuration
 
-Update the following variables in `inventory_etl.py` if needed:
+Update the following variables in `odoo_inventory_pipeline.py` if needed:
 
 ```python
 # Odoo Settings
