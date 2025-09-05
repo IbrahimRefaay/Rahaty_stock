@@ -2,14 +2,17 @@ name: Odoo Inventory ETL
 
 on:
   schedule:
-    # Runs once daily at 00:15 UTC (3:15 AM Riyadh time)
-    # A different time from your other workflow to avoid conflicts
+    # Runs once daily at 00:15 UTC
     - cron: '15 0 * * *'
   workflow_dispatch: # Allows you to run it manually from the Actions tab
 
 jobs:
   run-inventory-etl:
     runs-on: ubuntu-latest
+    # --- MODIFICATION: Add permissions for the Google Auth action ---
+    permissions:
+      contents: 'read'
+      id-token: 'write'
 
     steps:
       - name: Checkout repository
@@ -23,17 +26,24 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # Assuming you have a requirements.txt file with pandas, requests, google-cloud-bigquery, etc.
           pip install -r requirements.txt
       
-      - name: Create credentials file from secret
-        run: |
-          echo '${{ secrets.GCP_SA_KEY }}' > gcp-key.json
-        shell: bash
+      # --- MODIFICATION: Use the official action for Google Cloud authentication ---
+      # This replaces the need to manually create the gcp-key.json file.
+      - name: Authenticate to Google Cloud
+        id: 'auth'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
 
       - name: Run Inventory ETL script
+        # --- MODIFICATION: Provide ALL required secrets to the script ---
         env:
-          # This makes the gcp-key.json file discoverable by Google's libraries
-          GOOGLE_APPLICATION_CREDENTIALS: 'gcp-key.json'
-          # This securely provides the Odoo password to your Python script
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
           ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
-        run: python odoo_inventory_pipeline.py
+          # The Google Auth step above handles authentication automatically,
+          # so GOOGLE_APPLICATION_CREDENTIALS is no longer needed here.
+        run: python odoo_inventory_pipeline.py # Or inventory_etl.py, use your correct filename
